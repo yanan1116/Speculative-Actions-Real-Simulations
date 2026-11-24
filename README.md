@@ -1,255 +1,110 @@
-# [Speculative Macro Commit for Faster Tool-Using Agents](https://arxiv.org/abs/2609.03236)
+# Speculative Actions on AppWorld
 
-Official implementation of **Speculative Macro Commit (SMC)**. SMC verifies a
-speculative action and, when the verified prefix matches a learned macro-step,
-commits several following actions together. This repository contains the
-AppWorld and tau2 Telecom implementations used in the camera-ready paper.
+This repository evaluates **Speculative Actions (SA)** in AppWorld, a stateful simulator. We run the same tasks with a sequential baseline and with SA to measure task latency and success. SA spends extra inference on guesses so the Actor can start its next step early. The simulator lets us check whether discarded guesses leave side effects. [SA paper](https://arxiv.org/abs/2510.04371) · [AppWorld](https://github.com/StonyBrookNLP/appworld)
 
-The release has two independent parts:
+## How SA works
 
-- **Library construction:** mine reusable action sequences from training runs.
-- **Macro execution:** load a frozen library, match it after verification, and
-  skip the corresponding actor decisions.
+At step `t`, the Actor and Speculator receive the same committed history `H_t`. The runner deduplicates the Speculator's samples and processes eligible guesses one at a time while the Actor is still generating. Each isolated tool result lets the runner start another Actor request for step `t+1`. That inference can overlap the remaining step-`t` generation and its live tool call.
 
-The two libraries used for the paper are included under `libraries/`.
-
-## Main results
-
-| Benchmark | Tasks | Baseline | Speculative Action | SMC |
-| --- | ---: | ---: | ---: | ---: |
-| tau2 Telecom | 2,285 | 99.52% / 27.60 s | 99.47% / 25.03 s | **99.52% / 22.47 s** |
-| AppWorld `test_normal` | 168 | 41.67% / 355.7 s | 41.67% / 212.1 s | **40.48% / 195.9 s** |
-
-Each cell reports success and mean wall-clock time per task. Runtime depends on
-the GPU, serving stack, and cache state; use the checked-in configurations when
-comparing against these numbers.
-
-## Repository structure
+The example uses eight samples. The experiments use five. Here `g1`–`g3` are allowlisted read-only calls and `g4` is a write call outside the allowlist. Allowlisted write calls can also run in isolation.
 
 ```text
-configs/          paper and mining configurations for both benchmarks
-environment/      Conda environments for serving, AppWorld, and tau2
-libraries/        the two frozen macro-step libraries and their manifest
-scripts/          model-server, experiment, and result-summary entry points
-smc_appworld/     AppWorld runtime, runner, and library miner
-tau2_telecom/     tau2 runtime, runner, label collector, and library miner
+Actor A       Actor(H_t) ───────────────────────────────────► a_t
+Speculator C  Speculator(H_t)
+                └─ 8 samples → deduplicate → g1, g2, g3, g4
+                   g1 → isolated call → o1 → Actor_B(H_t + g1 + o1) → F1
+                   g2 → isolated call → o2 → Actor_B(H_t + g2 + o2) → F2
+                   g3 → isolated call → o3 → Actor_B(H_t + g3 + o3) → F3
+                   g4 → defer to live execution if chosen
+
+When a_t arrives
+  Find an exact match on tool name and all arguments.
+  Request cancellation of unmatched branches (F1 and F3 if a_t == g2).
+  Execute a_t on live AppWorld → o_t.
+
+  a_t == g2, F2 exists, and o_t == o2 → keep F2 → F2.result() for step t+1
+  Otherwise → cancel any remaining branch → start Actor_A(H_t + a_t + o_t)
+                                              if the task continues
 ```
 
-The main method implementations are
-`smc_appworld/runtime/pipeline_agent.py` and
-`tau2_telecom/src/runner.py`. Most experiments only need the JSON configs and
-the entry points shown below.
+`F1`, `F2`, and `F3` are Futures for streaming requests submitted to the runner's thread pool. `F2.result()` returns the Actor response immediately if it is ready, or waits for the remaining generation. After a hit, the runner uses that response for step `t+1` and skips speculation on that step. Cancellation closes the client stream when it handles the signal. Server work can continue until it detects the disconnect, and discarded branches still cost the tokens they already generated. [SA runner](appworld/sa_appworld/runtime/sa_breadth_agent.py)
 
-## Installation
+### How tool calls are isolated
 
-The model server and benchmark clients use separate environments:
+The runner uses a 456-API allowlist and reserves `supervisor.complete_task` for live execution. Model requests run concurrently. AppWorld calls run one at a time on the main thread. [API allowlist](appworld/sa_appworld/runtime/preexec_verified_apis_v4.json)
+
+1. **Keep a clean copy.** The runner holds an in-memory SQLite copy of each app database. After a live call, it refreshes the copies of databases whose change logs grew.
+2. **Run and roll back the guess.** The runner snapshots model write counters, the interaction count, I/O and request logs, token blacklists, and Python's global RNG. It disables on-disk saves during the call. A `finally` block identifies writes from the change logs, restores those databases from their clean copies, truncates their change logs, and restores the remaining state. A restore failure aborts the task before evaluation.
+3. **Check the live observation.** The runner executes the Actor's actual call on the restored environment. It reuses a pre-launched response only when the complete call and the live output match the guessed call and output. The replay audit checks tool outputs, saved databases and logs, and the task reward.
+
+[Isolation implementation](appworld/sa_appworld/runtime/env_isolation.py) · [Replay audit](appworld/scripts/audit_sa_isolation.py)
+
+## Results
+
+The four runs below predate the refactor. Post-refactor checks were offline. Each run used the same 194 test tasks, with up to 200 steps per task. Baseline used one Qwen3.8-27B-FP8 GPU. SA used two of those Actor GPUs and a Qwen3.5-4B Speculator on a third GPU. All GPUs were RTX 6000 Ada.
+
+| Actor thinking | In flight | Baseline success | SA success | Median ratio | Total ratio | Replay passed |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| On | 1 task per arm | 82.5% | 88.1% | 0.874 | 0.750 | 194/194 |
+| Off | 1 task per arm | 78.9% | 76.8% | 0.891 | 0.901 | 194/194 |
+| Off | 2 task pairs | 78.4% | 76.3% | 0.888 | 0.926 | 194/194 |
+| Off | 4 task pairs | 77.3% | 75.3% | 0.940 | 1.310 | 193/194 |
+
+Ratios are SA time divided by baseline time. The median uses paired task ratios. The total uses summed task times. Baseline sums timed steps and SA times its full loop, including in-loop logging. Both exclude environment setup and evaluation. Success means all unit tests passed. Both arms sample independently.
+
+At four task pairs, SA still sped up most tasks, but summed task time rose by 31%. The sole replay mismatch affected two tool outputs and the I/O log because of a login-token expiry difference. Saved database changes and reward matched. An extra RNG draw reproduced the original outputs, and the source of that draw remains unconfirmed. [Latency distributions](docs/appworld_sa_latency_distribution_grid.png)
+
+## Run from `appworld/`
+
+Use Linux with Python 3.11, Bash, `curl`, and `bc`.
 
 ```bash
-conda env create -f environment/serving.yml
-conda env create -f environment/appworld.yml
-conda env create -f environment/tau2.yml
+cd appworld
+python3.11 -m venv .venv
+.venv/bin/python -m pip install appworld==0.1.3 openai==1.109.1 httpx==0.27.2
+.venv/bin/appworld install
+export APPWORLD_ROOT="$PWD"
+.venv/bin/appworld download data --root "$APPWORLD_ROOT"  # data 0.1.0
 ```
 
-Install AppWorld data using its upstream CLI, then pass the resulting root to
-the runner:
+For the historical setup, start one vLLM 0.33.0 process per GPU. Use `MODEL=Qwen/Qwen3.8-27B-FP8` with `MAX_LEN=128000` for A, B, and D. Use `MODEL=Qwen/Qwen3.5-4B` with `MAX_LEN=262144` for C. Set `GPU`, `PORT`, and the shared `SMC_API_KEY` for each process. [vLLM serve reference](https://docs.vllm.ai/en/v0.33.0/cli/serve/)
 
 ```bash
-conda activate smc-appworld
-appworld install
-appworld download data
+CUDA_VISIBLE_DEVICES="$GPU" vllm serve "$MODEL" --port "$PORT" --api-key "$SMC_API_KEY" \
+    --max-model-len "$MAX_LEN" --gpu-memory-utilization 0.97 --enable-prefix-caching \
+    --trust-remote-code --limit-mm-per-prompt '{"image": 0, "video": 0}' \
+    --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3
 ```
 
-The tau2 environment installs the fixed code revision used by this release.
-Its benchmark data can be obtained from the upstream repository:
+On the client, set the same key and the four endpoint URLs. The task generator selects one task per scenario with a fixed seed and excludes `0de03ad_2` for exceeding the Actor context window.
 
 ```bash
-git clone https://github.com/sierra-research/tau2-bench.git external/tau2-bench
-git -C external/tau2-bench checkout 7483cc60e4957fb2cf834c05a41059a715ee287c
-export TAU2_DATA_DIR="$PWD/external/tau2-bench/data"
+export SMC_API_KEY='<shared server key>'
+export BASELINE_URL='http://host-d:port/v1'
+export SA_ACTOR_URL='http://host-a:port/v1'
+export SA_PRELAUNCH_URL='http://host-b:port/v1'
+export SA_SPECULATOR_URL='http://host-c:port/v1'
+export OUT_DIR="$PWD/runs"
+mkdir -p "$OUT_DIR"
+export TASKS="$OUT_DIR/test_scen1_tasks_le128k.txt"
+.venv/bin/python scripts/make_test_scen1_tasks.py --appworld-root "$APPWORLD_ROOT" > "$TASKS"
+
+scripts/run_serial.sh on    # test_scen1_serial1don
+scripts/run_serial.sh off   # test_scen1_serial1doff
+scripts/run_pairs.sh off 2  # test_scen1_stress2doff
+scripts/run_pairs.sh off 4  # test_scen1_stress4doff
 ```
 
-## Launch model servers
+The serial driver runs one task per arm independently. The paired driver waits for both arms before reusing a slot. To run all 585 test tasks, generate a second list with `--full`, point `TASKS` to it, and use a separate `OUT_DIR`. On resume, the drivers skip existing result files, including files with `error_type`.
 
-Activate `smc-serving` and start each command in a separate terminal. The
-default paper setup uses one drafter and two actor endpoints:
+Summarize and replay-audit a finished run by substituting its tag and thinking mode. The audit reads the SA run's raw trajectories and the corresponding files in `$APPWORLD_ROOT/experiments/outputs/`.
 
 ```bash
-# AppWorld
-./scripts/serve_vllm.sh appworld-drafter 0 8003
-./scripts/serve_vllm.sh appworld-actor   1 8004
-./scripts/serve_vllm.sh appworld-actor   2 8005
-
-# tau2 Telecom: use these profiles instead
-./scripts/serve_vllm.sh tau2-drafter 0 8003
-./scripts/serve_vllm.sh tau2-actor   1 8004
-./scripts/serve_vllm.sh tau2-actor   2 8005
+TAG=test_scen1_serial1doff
+.venv/bin/python scripts/summarize_sa_runs.py --out-dir "$OUT_DIR" --tag "$TAG" --mode off \
+    --appworld-root "$APPWORLD_ROOT" --tasks "$TASKS"
+.venv/bin/python scripts/audit_sa_isolation.py --run-dir "$OUT_DIR/${TAG}_sa_k5_spec4b_sa" \
+    --appworld-root "$APPWORLD_ROOT"
 ```
 
-The checkpoint names and vLLM flags are kept in `scripts/serve_vllm.sh`.
-Before a run, check that `/v1/models` responds on ports 8003, 8004, and 8005.
-The paper timing path used a fresh server epoch followed by readiness checks;
-it did not require a separate generation warmup.
-
-## AppWorld
-
-With the AppWorld servers ready, a one-task mechanism check is:
-
-```bash
-conda activate smc-appworld
-python -m smc_appworld.run \
-  --config configs/appworld/smc.json \
-  --task-ids-file configs/appworld/smoke.json \
-  --appworld-root /path/to/appworld-root \
-  --run-id smc_smoke --no-resume
-```
-
-For the paper evaluation, SA and SMC are alternated task by task to balance the
-shared prefix cache. The command is a dry run unless `--execute` is supplied:
-
-```bash
-python scripts/run_appworld_paired.py
-python scripts/run_appworld_paired.py \
-  --execute \
-  --appworld-root /path/to/appworld-root \
-  --run-id appworld_sa_smc
-```
-
-Run the baseline in a separate fresh server epoch:
-
-```bash
-python -m smc_appworld.run \
-  --config configs/appworld/baseline.json \
-  --appworld-root /path/to/appworld-root \
-  --run-id appworld_baseline --no-resume
-```
-
-Summarize a new baseline/SA/SMC set with:
-
-```bash
-python scripts/summarize_appworld_runs.py \
-  --baseline runs/appworld/appworld_baseline_baseline \
-  --sa runs/appworld_paired/appworld_sa_smc/sa \
-  --smc runs/appworld_paired/appworld_sa_smc/smc \
-  --strict
-```
-
-## tau2 Telecom
-
-The SMC smoke uses a task that fired a macro in the paper environment:
-
-```bash
-conda activate smc-tau2
-python scripts/run_tau2_config.py configs/tau2/smc.json \
-  --task-ids-file configs/tau2/smoke.json \
-  --run-id smc_smoke
-```
-
-The full configurations are direct entry points. Start a fresh server epoch
-before each independent arm:
-
-```bash
-python scripts/run_tau2_config.py configs/tau2/baseline.json --run-id baseline
-python scripts/run_tau2_config.py configs/tau2/sa.json       --run-id sa
-python scripts/run_tau2_config.py configs/tau2/smc.json      --run-id smc
-```
-
-The runner writes compact and resumable results under `runs/tau2/`. A new
-three-arm run can be summarized with:
-
-```bash
-python tau2_telecom/scripts/analyze_macro_runs.py \
-  --run-dir runs/tau2 --arms baseline sa smc --baseline-arm baseline \
-  --out-json runs/tau2_summary.json --out-md runs/tau2_summary.md
-```
-
-## Build macro-step libraries
-
-For reproducing the paper evaluation, use the frozen files rather than
-re-mining them:
-
-| Benchmark | Construction | Frozen library |
-| --- | --- | --- |
-| AppWorld | action n-grams, frequency >= 5, coverage >= 0.10; no LCB | `libraries/appworld_train50.json` (90 patterns) |
-| tau2 Telecom | support >= 3, offline LCB >= 0.50, top 200 | `libraries/tau2_sup3_lcb050.json` |
-
-To rebuild an AppWorld library, first collect successful training trajectories
-and then run the miner:
-
-```bash
-python -m smc_appworld.run \
-  --mode baseline --split train --max-steps 50 \
-  --actor-url http://localhost:8004/v1 \
-  --appworld-root /path/to/appworld-root \
-  --run-id appworld_train_maxsteps50 \
-  --save-raw-trajectories --no-resume
-
-python -m smc_appworld.mining --config configs/appworld/mining.json
-```
-
-For tau2, collect successful owner runs, label drafter continuations, and mine
-the library grid:
-
-```bash
-python tau2_telecom/scripts/prepare_task_ids.py \
-  --out-dir runs/mining/tau2_task_ids
-
-python scripts/run_tau2_config.py configs/tau2/baseline.json \
-  --task-ids-file runs/mining/tau2_task_ids/small_train.json \
-  --run-id golden_small_train --out-dir runs/mining/tau2_golden
-
-python scripts/run_tau2_mining_config.py configs/tau2/mining.json collect \
-  --results-dir runs/mining/tau2_golden/golden_small_train/results \
-  --output runs/mining/tau2_labels.jsonl
-
-python scripts/run_tau2_mining_config.py configs/tau2/mining.json mine \
-  --labels runs/mining/tau2_labels.jsonl \
-  --out-dir runs/mining/tau2_libraries
-```
-
-LCB is only part of tau2's **offline library construction**. AppWorld did not
-use it. The released tau2 library was filtered with the historical
-`camera_ready_wilson` fallback; the paper describes the corresponding Beta
-posterior lower quantile. An exact-Beta audit kept the same final 200 action
-sequences, but changed their scores and order, so evaluation uses the frozen
-file. The runtime threshold remains zero because it does not filter the
-already-filtered library a second time.
-
-Freshly sampled trajectories may produce a different library. Re-mining
-reproduces the construction procedure; loading the frozen files reproduces the
-paper execution path.
-
-## Evaluation notes
-
-- Each runner creates fresh benchmark state for every task.
-- Restart the model servers between independent arms; do not reuse a smoke
-  epoch for timed evaluation.
-- A smoke checks that verification, matching, and macro commit can fire. It is
-  successful when its summary has no task error and reports nonzero macro hits
-  and skipped steps; it is not evidence for full-benchmark accuracy or latency.
-- Raw trajectories and run outputs may contain benchmark-sensitive content;
-  `runs/`, `*.jsonl`, and raw trajectories are ignored by Git.
-
-## Citation
-
-Please cite the accompanying paper if you use this code:
-
-```bibtex
-@misc{liu2026speculativemacrocommitfaster,
-      title={Speculative Macro Commit for Faster Tool-Using Agents}, 
-      author={Zeyu Liu and Souvik Kundu and Peter A. Beerel},
-      year={2026},
-      eprint={2609.03236},
-      archivePrefix={arXiv},
-      primaryClass={cs.AI},
-      url={https://arxiv.org/abs/2609.03236}, 
-}
-```
-
-The same metadata is available in `CITATION.cff` for GitHub's citation menu.
-
-## License and acknowledgments
-
-The authors' code is released under Apache-2.0. [AppWorld](https://github.com/StonyBrookNLP/appworld),
-[tau2-bench](https://github.com/sierra-research/tau2-bench), model weights,
-and benchmark data retain their upstream licenses and are not redistributed
-here.
+Licensed under Apache 2.0. [License](LICENSE) · [Upstream attribution](https://github.com/zeyuliu1037/speculative-macro-commit)

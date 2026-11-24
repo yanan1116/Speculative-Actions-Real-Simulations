@@ -128,16 +128,27 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "complete_task",
-            "description": "Mark the task as complete and submit the final output/answer.",
+            # AppWorld's supervisor.complete_task(answer, status); the descriptions follow its API doc.
+            "description": "Mark the currently active task as complete, with the answer if the task asks for one.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "output": {
+                    "answer": {
                         "type": "string",
-                        "description": "The final answer or output for the task.",
-                    }
+                        "description": (
+                            "The answer to the task instruction. Pass it if and only if the task requests an answer, "
+                            "e.g., 'How many songs are in the Spotify queue?'. The answer must be concise, such as a "
+                            "number, a yes/no, or a specific entity, name, etc, e.g., '10' in this case. If the task "
+                            "is not a question, e.g., 'Start my Spotify music player.', omit it."
+                        ),
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": ["success", "fail"],
+                        "description": "'success' (default), or 'fail' if the task cannot be done.",
+                    },
                 },
-                "required": ["output"],
+                "required": [],
             },
         },
     },

@@ -1,8 +1,6 @@
-"""Paper-relevant summaries for compact AppWorld result records.
+"""Run summaries (summary.json) for compact AppWorld result records: accuracy and wall time per arm.
 
-This module intentionally depends only on the Python standard library.  Both
-AppWorld runners and the offline comparison command use it so that accuracy,
-wall-time, and macro-commit counters have one definition.
+This module intentionally depends only on the Python standard library.
 """
 
 from __future__ import annotations
@@ -12,7 +10,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 
-MODES = frozenset({"baseline", "sa", "smc"})
+MODES = frozenset({"baseline", "sa"})
 
 
 class SummaryError(ValueError):
@@ -107,18 +105,6 @@ def build_run_summary(
             wall_fields.add(field)
             wall_values.append(value)
 
-    macro_hits = 0
-    macro_steps_skipped = 0
-    macro_fire_tasks = 0
-    for row in completed_rows:
-        hits = _nonnegative_counter(row.get("meta_tool_hits", 0), "meta_tool_hits")
-        skipped = _nonnegative_counter(
-            row.get("meta_tool_steps_skipped", 0), "meta_tool_steps_skipped"
-        )
-        macro_hits += hits
-        macro_steps_skipped += skipped
-        macro_fire_tasks += hits > 0
-
     observed = len(rows)
     completed = len(completed_rows)
     errors = len(error_rows)
@@ -150,9 +136,6 @@ def build_run_summary(
         "mean_wall_s": mean_wall_s,
         "mean_wall_s_completed": mean_wall_s if complete_wall_coverage else None,
         "complete_wall_coverage": complete_wall_coverage,
-        "macro_hits": macro_hits,
-        "macro_steps_skipped": macro_steps_skipped,
-        "macro_fire_tasks": macro_fire_tasks,
     }
     if include_results:
         summary["results"] = rows

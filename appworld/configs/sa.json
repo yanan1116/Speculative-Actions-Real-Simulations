@@ -1,0 +1,30 @@
+{
+  "mode": "sa",
+  "max_steps": 200,
+  "actor_model": "Qwen/Qwen3.8-27B-FP8",
+  "speculator_model": "Qwen/Qwen3.5-4B",
+  "thinking_budget": 4096,
+  "owner_max_tokens": 8192,
+  "actor_thinking": "on",
+  "actor_sampling": {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 20,
+    "min_p": 0.0,
+    "presence_penalty": 0.0,
+    "repetition_penalty": 1.0
+  },
+  "spec_breadth": 5,
+  "spec_sampling": {
+    "temperature": 0.7,
+    "top_p": 0.8,
+    "top_k": 20,
+    "min_p": 0.0,
+    "presence_penalty": 1.5,
+    "repetition_penalty": 1.0
+  },
+  "spec_max_tokens": 1024,
+  "actor_request_timeout": 1800,
+  "infra_retries": 3,
+  "save_raw_trajectories": true
+}

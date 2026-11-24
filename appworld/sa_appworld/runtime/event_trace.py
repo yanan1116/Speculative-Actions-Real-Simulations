@@ -2,7 +2,7 @@
 
 Design goals:
   1. Zero-overhead when disabled (NullTracer is a no-op singleton)
-  2. Monotonic timestamps via perf_counter (same source as pipeline_agent)
+  2. Monotonic timestamps via perf_counter (same source as agent.py)
   3. Thread-safe append to a per-sample JSONL file
   4. Logical-lane-aware: caller tags each event with a `component` string
      that maps to a Chrome Trace pid/tid, not an OS thread (thread pools
@@ -217,7 +217,7 @@ def make_tracer(out_path: Optional[str], sample_id: str,
     """Factory: returns EventTracer if out_path is provided, NullTracer
     otherwise.
 
-    This lets pipeline_agent and agent accept an optional tracer without
+    This lets the agent accept an optional tracer without
     adding conditional branches at every call site — just call
     `tracer.emit(...)` unconditionally.
     """
