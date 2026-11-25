@@ -9,7 +9,11 @@
 # Run tag RUN_TAG (default test_scen1_seq<MODE>); writes <OUT_DIR>/<tag>.{log,jsonl,load.jsonl} and the two run
 # directories. Restartable: an arm that already has a result for the task is skipped. Stops after 3 consecutive tasks
 # with a missing result. Exit 0 only if both arms have a result for every task.
+# ARMS (default "baseline sa") selects the arms to run, e.g. ARMS=sa reuses an earlier baseline run; the completeness
+# checks then cover only the selected arms.
 MODE=${1:?usage: run_sequential.sh on|off}
+ARMS=${ARMS:-baseline sa}
+for a in $ARMS; do case $a in baseline|sa) ;; *) echo "ARMS must list baseline and/or sa, got '$ARMS'" >&2; exit 2 ;; esac; done
 source "$(dirname "$0")/common.sh"
 cd "$REPO" || exit 1
 TAG=${RUN_TAG:-test_scen1_seq$MODE}
@@ -54,14 +58,16 @@ arm() {  # index, task, name, result dir, stdout file, args...
   [ -f "$dir/results/$task.json" ]
 }
 
+has_arm() { case " $ARMS " in *" $1 "*) return 0 ;; esac; return 1; }
+
 start_sampler
-log "start: $(wc -l < "$TASKS") tasks, one at a time, baseline then SA"
+log "start: $(wc -l < "$TASKS") tasks, one at a time, arms: $ARMS"
 index=0; fails=0
 for task in $(cat "$TASKS"); do
   index=$((index + 1))
   ok=1
-  arm "$index" "$task" baseline "$BASE_DIR" "$OUT_DIR/${TAG}_baseline.out" "${BASE_ARGS[@]}" || ok=0
-  arm "$index" "$task" sa "$SA_DIR" "$OUT_DIR/${TAG}_sa.out" "${SA_ARGS[@]}" || ok=0
+  if has_arm baseline; then arm "$index" "$task" baseline "$BASE_DIR" "$OUT_DIR/${TAG}_baseline.out" "${BASE_ARGS[@]}" || ok=0; fi
+  if has_arm sa; then arm "$index" "$task" sa "$SA_DIR" "$OUT_DIR/${TAG}_sa.out" "${SA_ARGS[@]}" || ok=0; fi
   if [ $ok -eq 1 ]; then
     fails=0; log "[$index] $task done"
   else

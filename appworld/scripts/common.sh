@@ -107,12 +107,14 @@ start_sampler() {
   SAMPLER=$!
 }
 
-# Exit 0 only if every task has both result files.
+# Exit 0 only if every task has a result file for each arm in ARMS (default: both).
 finish() {
   local n=0 total t
   total=$(wc -l < "$TASKS")
   for t in $(cat "$TASKS"); do
-    [ -f "$BASE_DIR/results/$t.json" ] && [ -f "$SA_DIR/results/$t.json" ] && n=$((n + 1))
+    case " ${ARMS:-baseline sa} " in *" baseline "*) [ -f "$BASE_DIR/results/$t.json" ] || continue ;; esac
+    case " ${ARMS:-baseline sa} " in *" sa "*) [ -f "$SA_DIR/results/$t.json" ] || continue ;; esac
+    n=$((n + 1))
   done
   if [ "$n" -eq "$total" ]; then log "all done ($n pairs)"; touch "$OUT_DIR/$TAG.done"; exit 0; fi
   log "finished with $n/$total complete pairs"; exit 1
