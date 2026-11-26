@@ -11,6 +11,9 @@
 # with a missing result. Exit 0 only if both arms have a result for every task.
 # ARMS (default "baseline sa") selects the arms to run, e.g. ARMS=sa reuses an earlier baseline run; the completeness
 # checks then cover only the selected arms.
+# GPU_IDLE (optional, HOST:GPU_INDEX, e.g. 10.225.68.24:1): the drain gate also requires that GPU to read 0% utilization
+# (nvidia-smi over ssh) at both checks, so no kernel of the previous arm is still running when the next arm starts; the
+# reading at the passing check is recorded as gpu_util_at_start. Unset = endpoint metrics only (unchanged).
 MODE=${1:?usage: run_sequential.sh on|off}
 ARMS=${ARMS:-baseline sa}
 for a in $ARMS; do case $a in baseline|sa) ;; *) echo "ARMS must list baseline and/or sa, got '$ARMS'" >&2; exit 2 ;; esac; done
@@ -33,14 +36,25 @@ endpoints_idle() {
   done
 }
 
-# Drain gate: wait until the endpoints are idle twice in a row, 2 s apart. Sets DRAIN_SECONDS.
+# 0 if GPU_IDLE is unset, or its GPU reads 0% utilization; 1 otherwise (busy or no reading). Sets GPU_UTIL.
+gpu_idle() {
+  GPU_UTIL=null
+  [ -n "${GPU_IDLE-}" ] || return 0
+  GPU_UTIL=$(ssh -o ConnectTimeout=5 -o BatchMode=yes "${GPU_IDLE%%:*}" nvidia-smi -i "${GPU_IDLE##*:}" \
+    --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null | tr -d ' ')
+  case $GPU_UTIL in ''|*[!0-9]*) GPU_UTIL=null; return 1 ;; esac
+  [ "$GPU_UTIL" -eq 0 ]
+}
+
+# Drain gate: wait until the endpoints (and the GPU_IDLE GPU, if set) are idle twice in a row, 2 s apart.
+# Sets DRAIN_SECONDS and GPU_UTIL.
 drain() {
   local start last_log
   start=$(date +%s); last_log=$start
   while :; do
-    if endpoints_idle; then sleep 2; endpoints_idle && break; fi
+    if endpoints_idle && gpu_idle; then sleep 2; endpoints_idle && gpu_idle && break; fi
     if [ $(( $(date +%s) - last_log )) -ge 60 ]; then
-      log "waiting for idle endpoints ($(( $(date +%s) - start )) s)"; last_log=$(date +%s)
+      log "waiting for idle endpoints ($(( $(date +%s) - start )) s)${GPU_IDLE:+, GPU util $GPU_UTIL%}"; last_log=$(date +%s)
     fi
     sleep 1
   done
@@ -54,7 +68,7 @@ arm() {  # index, task, name, result dir, stdout file, args...
   drain
   s=$(date +%s.%N)
   "$PYTHON" -u sa_appworld/run.py "$@" --task-id "$task" >> "$out" 2>&1; rc=$?
-  echo "{\"index\": $index, \"task\": \"$task\", \"arm\": \"$name\", \"rc\": $rc, \"drain_seconds\": $DRAIN_SECONDS, \"process_seconds\": $(echo "$(date +%s.%N) - $s" | bc), \"finished\": \"$(date '+%F %T %Z')\"}" >> "$RECORDS"
+  echo "{\"index\": $index, \"task\": \"$task\", \"arm\": \"$name\", \"rc\": $rc, \"drain_seconds\": $DRAIN_SECONDS, \"gpu_util_at_start\": $GPU_UTIL, \"process_seconds\": $(echo "$(date +%s.%N) - $s" | bc), \"finished\": \"$(date '+%F %T %Z')\"}" >> "$RECORDS"
   [ -f "$dir/results/$task.json" ]
 }
 
